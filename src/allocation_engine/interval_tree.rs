@@ -2,9 +2,9 @@
 // Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2
 
+use crate::{AllocPolicy, Constraint, Error, Result, Space};
 use std::cmp::{max, Ordering};
-
-use crate::{AllocPolicy, Constraint, Error, RangeInclusive, Result};
+use std::convert::TryFrom;
 
 /// Returns the first multiple of `alignment` that is lower or equal to the
 /// specified address. This method works only for alignment values that are a
@@ -58,7 +58,7 @@ impl NodeState {
 #[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub(crate) struct InnerNode {
     /// Interval handled by this node.
-    key: RangeInclusive,
+    key: Space<u64>,
     /// NodeState, can be Free or Allocated.
     node_state: NodeState,
     /// Optional left child of current node.
@@ -71,7 +71,7 @@ pub(crate) struct InnerNode {
 
 impl InnerNode {
     /// Creates a new InnerNode object.
-    fn new(key: RangeInclusive, node_state: NodeState) -> Self {
+    fn new(key: Space<u64>, node_state: NodeState) -> Self {
         InnerNode {
             key,
             node_state,
@@ -83,7 +83,7 @@ impl InnerNode {
 
     /// Returns a readonly reference to the node associated with the `key` or
     /// None if the searched key does not exist in the tree.
-    fn search(&self, key: &RangeInclusive) -> Option<&InnerNode> {
+    fn search(&self, key: &Space<u64>) -> Option<&InnerNode> {
         match self.key.cmp(key) {
             Ordering::Equal => Some(self),
             Ordering::Less => self.right.as_ref().and_then(|node| node.search(key)),
@@ -95,10 +95,10 @@ impl InnerNode {
     /// None if there is no Node representing an interval that covers the
     /// searched key. For a key [a, b], this method will return a node with
     /// a key [c, d] such that c <= a and b <= d.
-    fn search_superset(&self, key: &RangeInclusive) -> Option<&InnerNode> {
-        if self.key.contains(key) {
+    fn search_superset(&self, key: &Space<u64>) -> Option<&InnerNode> {
+        if self.key.encompasses(key) {
             Some(self)
-        } else if key.end < self.key.start {
+        } else if key.end() < self.key.start() {
             self.left
                 .as_ref()
                 .and_then(|node| node.search_superset(key))
@@ -231,11 +231,7 @@ impl InnerNode {
     /// tree will be balanced. The node_state parameter is needed because in
     /// the AddressAllocator allocation logic we will need to insert both free
     /// and allocated nodes.
-    fn insert(
-        mut self: Box<Self>,
-        key: RangeInclusive,
-        node_state: NodeState,
-    ) -> Result<Box<Self>> {
+    fn insert(mut self: Box<Self>, key: Space<u64>, node_state: NodeState) -> Result<Box<Self>> {
         // The InnerNode structure has 48 a length of 48 bytes. With other nested
         // calls that are made during the insertion process the size occupied
         // on the stack by just one insert call is around 122 bytes. Considering
@@ -254,7 +250,7 @@ impl InnerNode {
             return Err(Error::Overlap(key, self.key));
         }
         match self.key.cmp(&key) {
-            // It is not possible for a RangeInclusive to be equal with an existing node
+            // It is not possible for a Space::<u64> to be equal with an existing node
             // as the overlaps method will also catch this case and return the
             // corresponding error code.
             Ordering::Equal => unreachable!(),
@@ -279,7 +275,7 @@ impl InnerNode {
     /// find an existing node with the state `NodeState::Free` that satisfies
     /// all constraints of an allocation request. The recursion is safe as we
     /// have in place a maximum height for the tree.
-    fn mark_as_allocated(&mut self, key: &RangeInclusive) -> Result<()> {
+    fn mark_as_allocated(&mut self, key: &Space<u64>) -> Result<()> {
         match self.key.cmp(key) {
             Ordering::Equal => {
                 if self.node_state != NodeState::Free {
@@ -303,7 +299,7 @@ impl InnerNode {
     ///
     /// Note: it doesn't return whether the key exists in the subtree, so caller
     /// need to ensure the logic.
-    fn delete(mut self: Box<Self>, key: &RangeInclusive) -> Option<Box<Self>> {
+    fn delete(mut self: Box<Self>, key: &Space<u64>) -> Option<Box<Self>> {
         match self.key.cmp(key) {
             Ordering::Equal => {
                 return self.delete_root();
@@ -329,11 +325,11 @@ impl InnerNode {
     }
 
     /// Returns the best node from the tree to place the desired memory slot
-    /// and a RangeInclusive object with the start address aligned to the value specified
-    /// in the constraint.The RangeInclusive returned by this method may be larger than
+    /// and a Space::<u64> object with the start address aligned to the value specified
+    /// in the constraint.The Space::<u64> returned by this method may be larger than
     /// what was requested. It's up for the caller to split the node if it wants
     /// to allocate the exact size from this node.
-    fn find_candidate(&self, constraint: &Constraint) -> Result<(&Self, RangeInclusive)> {
+    fn find_candidate(&self, constraint: &Constraint) -> Result<(&Self, Space<u64>)> {
         match constraint.policy {
             // Returns the first node from the managed address space that is
             // satisfying the specified constraints or `ResourceNotAvailable`
@@ -350,9 +346,8 @@ impl InnerNode {
                 // Search the node in the interval tree that contains the
                 // desired starting address.
                 let node = self
-                    .search_superset(&RangeInclusive::new(
-                        start_address,
-                        start_address.checked_add(1).ok_or(Error::Overflow)?,
+                    .search_superset(&Space::try_from(
+                        start_address..start_address.checked_add(1).ok_or(Error::Overflow)?,
                     )?)
                     .ok_or(Error::ResourceNotAvailable)?;
                 let end_address = start_address
@@ -360,8 +355,8 @@ impl InnerNode {
                     .ok_or(Error::Overflow)?;
                 // We should check that starting from the desired address the
                 // whole memory slot will fit in the selected node.
-                let range = RangeInclusive::new(start_address, end_address)?;
-                if !node.key.contains(&range) {
+                let range = Space::try_from(start_address..end_address)?;
+                if !node.key.encompasses(&range) {
                     return Err(Error::ResourceNotAvailable);
                 }
                 Ok((node, range))
@@ -372,7 +367,7 @@ impl InnerNode {
     /// Returns the first node from the managed address space that is satisfying
     /// the specified constraints and the aligned address of the desired memory
     /// slot. Or if the request can not be satisfied `ResourceNotAvailable`.
-    fn first_match(&self, constraint: &Constraint) -> Result<(&Self, RangeInclusive)> {
+    fn first_match(&self, constraint: &Constraint) -> Result<(&Self, Space<u64>)> {
         // Searches the first free node from the tree.
         let mut res = self
             .left
@@ -408,7 +403,7 @@ impl InnerNode {
     /// Returns the last node from the managed address space that is satisfying
     /// the specified constraints and the aligned address of the desired memory
     /// slot. Or if the request can not be satisfied `ResourceNotAvailable`.
-    fn last_match(&self, constraint: &Constraint) -> Result<(&Self, RangeInclusive)> {
+    fn last_match(&self, constraint: &Constraint) -> Result<(&Self, Space<u64>)> {
         // Searches the last free node from the tree.
         let mut res = self
             .right
@@ -443,9 +438,9 @@ impl InnerNode {
 
     /// Check that the candidate node is satisfying all the constraints for
     /// the requested memory slot.
-    fn check_constraint(&self, constraint: &Constraint) -> Result<RangeInclusive> {
+    fn check_constraint(&self, constraint: &Constraint) -> Result<Space> {
         // Exit if node is already allocated.
-        if !self.node_state.is_free() || self.key.len() < constraint.size {
+        if !self.node_state.is_free() || self.key.size() < constraint.size {
             return Err(Error::ResourceNotAvailable);
         }
         let node_key = self.key;
@@ -474,9 +469,9 @@ impl InnerNode {
             AllocPolicy::ExactMatch(_) => unreachable!(),
         };
         // Create the result range.
-        let key = RangeInclusive::new(range_start, self.key.end())?;
+        let key = Space::<u64>::try_from(range_start..self.key.end())?;
         // Check if the desired memory slot does fit in the candidate node.
-        if key.len() >= constraint.size() {
+        if key.size() >= constraint.size() {
             return Ok(key);
         }
         Err(Error::ResourceNotAvailable)
@@ -497,20 +492,20 @@ pub struct IntervalTree {
 impl IntervalTree {
     /// Creates a new IntervalTree object that is going to be used by the
     /// AddressAllocator.
-    pub fn new(key: RangeInclusive) -> Self {
+    pub fn new(key: Space<u64>) -> Self {
         IntervalTree {
             root: Some(Box::new(InnerNode::new(key, NodeState::Free))),
         }
     }
 
-    fn search_superset(&self, key: &RangeInclusive) -> Option<&InnerNode> {
+    fn search_superset(&self, key: &Space<u64>) -> Option<&InnerNode> {
         match self.root {
             None => None,
             Some(ref node) => node.search_superset(key),
         }
     }
 
-    fn insert(&mut self, key: RangeInclusive, node_state: NodeState) -> Result<()> {
+    fn insert(&mut self, key: Space<u64>, node_state: NodeState) -> Result<()> {
         match self.root.take() {
             None => self.root = Some(Box::new(InnerNode::new(key, node_state))),
             Some(node) => self.root = Some(node.insert(key, node_state)?),
@@ -518,7 +513,7 @@ impl IntervalTree {
         Ok(())
     }
 
-    fn mark_as_allocated(&mut self, key: &RangeInclusive) -> Result<()> {
+    fn mark_as_allocated(&mut self, key: &Space<u64>) -> Result<()> {
         match self.root.as_mut() {
             None => (),
             Some(node) => node.mark_as_allocated(key)?,
@@ -526,7 +521,7 @@ impl IntervalTree {
         Ok(())
     }
 
-    fn delete(&mut self, key: &RangeInclusive) -> Result<()> {
+    fn delete(&mut self, key: &Space<u64>) -> Result<()> {
         if let Some(node) = self.root.take() {
             if node.search(key).is_none() {
                 self.root = Some(node);
@@ -540,44 +535,43 @@ impl IntervalTree {
     /// This method implements the allocation logic for the address allocator.
     /// Given a set of constraints it will find the most suitable free node to
     /// fit the desired memory slot. This will modify the backing interval tree
-    /// such that the RangeInclusive representing the desired memory slot will appear as
+    /// such that the Space::<u64> representing the desired memory slot will appear as
     /// an node with the state `NodeState::Allocated` while the leftovers of
     /// the previous node will be present in the tree as free nodes.
-    pub fn allocate(&mut self, constraint: Constraint) -> Result<RangeInclusive> {
+    pub fn allocate(&mut self, constraint: Constraint) -> Result<Space<u64>> {
         // Return ResourceNotAvailable if we can not get a reference to the
         // root node.
         let root = self.root.as_ref().ok_or(Error::ResourceNotAvailable)?;
         let (node, range) = root.find_candidate(&constraint)?;
         let node_key = node.key;
-        // Create a new RangeInclusive starting at an address that is aligned to the
+        // Create a new Space::<u64> starting at an address that is aligned to the
         // value specified by constraint.
-        let result = RangeInclusive::new(
-            range.start(),
-            range
-                .start()
-                .checked_add(constraint.size())
-                .ok_or(Error::Overflow)
-                .and_then(|addr| addr.checked_sub(1).ok_or(Error::Underflow))?,
+        let result = Space::try_from(
+            range.start()
+                ..range
+                    .start()
+                    .checked_add(constraint.size())
+                    .ok_or(Error::Overflow)
+                    .and_then(|addr| addr.checked_sub(1).ok_or(Error::Underflow))?,
         )?;
 
         // Allocate a resource from the node, no need to split the candidate node.
-        if node_key.start() == result.start() && node_key.len() == constraint.size {
+        if node_key.start() == result.start() && node_key.size() == constraint.size {
             self.mark_as_allocated(&node_key)?;
             return Ok(node_key);
         }
 
         // If we do not find a node that is a perfect match we delete the old
         // node and insert three new nodes. The first node will represent the
-        // RangeInclusive [old_node.start, aligned_addr - 1] and will be marked as free.
+        // Space::<u64> [old_node.start, aligned_addr - 1] and will be marked as free.
         // The second node will have the state NodeState::Allocated and is
         // actually the requested memory slot. The last node will have the
         // state NodeState::Free and is what is left from the old node.
         self.delete(&node_key)?;
-        if result.start > node_key.start() {
+        if result.start() > node_key.start() {
             self.insert(
-                RangeInclusive::new(
-                    node_key.start(),
-                    result.start().checked_sub(1).ok_or(Error::Overflow)?,
+                Space::try_from(
+                    node_key.start()..result.start().checked_sub(1).ok_or(Error::Overflow)?,
                 )?,
                 NodeState::Free,
             )?;
@@ -586,9 +580,8 @@ impl IntervalTree {
         self.insert(result, NodeState::Allocated)?;
         if result.end() < node_key.end() {
             self.insert(
-                RangeInclusive::new(
-                    result.end().checked_add(1).ok_or(Error::Overflow)?,
-                    node_key.end(),
+                Space::try_from(
+                    result.end().checked_add(1).ok_or(Error::Overflow)?..node_key.end(),
                 )?,
                 NodeState::Free,
             )?;
@@ -597,52 +590,50 @@ impl IntervalTree {
     }
 
     /// Free an allocated range.
-    pub fn free(&mut self, key: &RangeInclusive) -> Result<()> {
+    pub fn free(&mut self, key: &Space<u64>) -> Result<()> {
         self.delete(key)?;
         let mut range = *key;
 
-        // If the deleted RangeInclusive did not start at 0 we try to find range that
+        // If the deleted Space::<u64> did not start at 0 we try to find range that
         // are placed to its left so we can merge them together.
         if range.start() > 0 {
-            if let Some(node) = self.search_superset(&RangeInclusive::new(
-                range.start().checked_sub(2).ok_or(Error::Underflow)?,
-                range.start().checked_sub(1).ok_or(Error::Underflow)?,
+            if let Some(node) = self.search_superset(&Space::try_from(
+                range.start().checked_sub(2).ok_or(Error::Underflow)?
+                    ..range.start().checked_sub(1).ok_or(Error::Underflow)?,
             )?) {
                 if node.node_state == NodeState::Free {
-                    range = RangeInclusive::new(node.key.start(), range.end())?;
+                    range = Space::try_from(node.key.start()..range.end())?;
                 }
             }
         }
         // If the deleted range did not end at u64::MAX we try to find ranges
         // that are placed to its left so we can merge them together.
         if range.end() < std::u64::MAX {
-            if let Some(node) = self.search_superset(&RangeInclusive::new(
-                range.end().checked_add(1).ok_or(Error::Overflow)?,
-                range.end().checked_add(2).ok_or(Error::Overflow)?,
+            if let Some(node) = self.search_superset(&Space::try_from(
+                range.end().checked_add(1).ok_or(Error::Overflow)?
+                    ..range.end().checked_add(2).ok_or(Error::Overflow)?,
             )?) {
                 if node.node_state == NodeState::Free {
-                    range = RangeInclusive::new(range.start(), node.key.end())?;
+                    range = Space::try_from(range.start()..node.key.end())?;
                 }
             }
         }
 
         // If we merged the freed node to the one on its left we should delete
-        // the left node as it now belongs to a bigger RangeInclusive that will be
+        // the left node as it now belongs to a bigger Space::<u64> that will be
         // inserted in the tree.
         if range.start() < key.start() {
-            self.delete(&RangeInclusive::new(
-                range.start(),
-                key.start().checked_sub(1).ok_or(Error::Underflow)?,
+            self.delete(&Space::try_from(
+                range.start()..key.start().checked_sub(1).ok_or(Error::Underflow)?,
             )?)?;
         }
 
         // If we merged the freed node to the one on its right we should delete
-        // the right node as it now belongs to a bigger RangeInclusive that will be
+        // the right node as it now belongs to a bigger Space::<u64> that will be
         // inserted in the tree.
         if range.end() > key.end() {
-            self.delete(&RangeInclusive::new(
-                key.end().checked_add(1).ok_or(Error::Overflow)?,
-                range.end(),
+            self.delete(&Space::try_from(
+                key.end().checked_add(1).ok_or(Error::Overflow)?..range.end(),
             )?)?;
         }
         // Insert in the tree the new created range.
@@ -684,39 +675,32 @@ mod tests {
     #[test]
     fn test_search() {
         let mut tree = Box::new(InnerNode::new(
-            RangeInclusive::new(0x100, 0x110).unwrap(),
+            Space::try_from(0x100..0x110).unwrap(),
             NodeState::Allocated,
         ));
-        let left_child = InnerNode::new(RangeInclusive::new(0x90, 0x99).unwrap(), NodeState::Free);
+        let left_child = InnerNode::new(Space::try_from(0x90..0x99).unwrap(), NodeState::Free);
 
         tree = tree.insert(left_child.key, left_child.node_state).unwrap();
         tree = tree
-            .insert(RangeInclusive::new(0x200, 0x2FF).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x200..0x2FF).unwrap(), NodeState::Free)
             .unwrap();
 
         assert_eq!(
-            tree.search(&RangeInclusive::new(0x90, 0x99).unwrap()),
+            tree.search(&Space::try_from(0x90..0x99).unwrap()),
             Some(&left_child)
         );
-        assert_eq!(
-            tree.search(&RangeInclusive::new(0x200, 0x250).unwrap()),
-            None
-        );
-        assert_eq!(
-            tree.search(&RangeInclusive::new(0x111, 0x1fe).unwrap()),
-            None
-        );
+        assert_eq!(tree.search(&Space::try_from(0x200..0x250).unwrap()), None);
+        assert_eq!(tree.search(&Space::try_from(0x111..0x1fe).unwrap()), None);
     }
 
     #[test]
     fn test_search_superset() {
         let mut tree = Box::new(InnerNode::new(
-            RangeInclusive::new(0x100, 0x110).unwrap(),
+            Space::try_from(0x100..0x110).unwrap(),
             NodeState::Allocated,
         ));
-        let right_child =
-            InnerNode::new(RangeInclusive::new(0x200, 0x2FF).unwrap(), NodeState::Free);
-        let left_child = InnerNode::new(RangeInclusive::new(0x90, 0x9F).unwrap(), NodeState::Free);
+        let right_child = InnerNode::new(Space::try_from(0x200..0x2FF).unwrap(), NodeState::Free);
+        let left_child = InnerNode::new(Space::try_from(0x90..0x9F).unwrap(), NodeState::Free);
 
         tree = tree.insert(left_child.key, left_child.node_state).unwrap();
         tree = tree
@@ -724,39 +708,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            tree.search_superset(&RangeInclusive::new(0x100, 0x101).unwrap()),
+            tree.search_superset(&Space::try_from(0x100..0x101).unwrap()),
             Some(&(*tree))
         );
         assert_eq!(
-            tree.search_superset(&RangeInclusive::new(0x90, 0x95).unwrap()),
+            tree.search_superset(&Space::try_from(0x90..0x95).unwrap()),
             Some(&left_child)
         );
         assert_eq!(
-            tree.search_superset(&RangeInclusive::new(0x200, 0x201).unwrap()),
+            tree.search_superset(&Space::try_from(0x200..0x201).unwrap()),
             Some(&right_child)
         );
         assert_eq!(
-            tree.search_superset(&RangeInclusive::new(0x200, 0x2FF).unwrap()),
+            tree.search_superset(&Space::try_from(0x200..0x2FF).unwrap()),
             Some(&right_child)
         );
         assert_eq!(
-            tree.search_superset(&RangeInclusive::new(0x209, 0x210).unwrap()),
+            tree.search_superset(&Space::try_from(0x209..0x210).unwrap()),
             Some(&right_child)
         );
         assert_eq!(
-            tree.search_superset(&RangeInclusive::new(0x2EF, 0x2FF).unwrap()),
+            tree.search_superset(&Space::try_from(0x2EF..0x2FF).unwrap()),
             Some(&right_child)
         );
         assert_eq!(
-            tree.search_superset(&RangeInclusive::new(0x2FF, 0x300).unwrap()),
+            tree.search_superset(&Space::try_from(0x2FF..0x300).unwrap()),
             None
         );
         assert_eq!(
-            tree.search_superset(&RangeInclusive::new(0x300, 0x301).unwrap()),
+            tree.search_superset(&Space::try_from(0x300..0x301).unwrap()),
             None
         );
         assert_eq!(
-            tree.search_superset(&RangeInclusive::new(0x1FF, 0x300).unwrap()),
+            tree.search_superset(&Space::try_from(0x1FF..0x300).unwrap()),
             None
         );
     }
@@ -779,109 +763,109 @@ mod tests {
     #[test]
     fn test_tree_insert_balanced() {
         let mut tree = Box::new(InnerNode::new(
-            RangeInclusive::new(0x300, 0x310).unwrap(),
+            Space::try_from(0x300..0x310).unwrap(),
             NodeState::Allocated,
         ));
         tree = tree
-            .insert(RangeInclusive::new(0x100, 0x110).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x100..0x110).unwrap(), NodeState::Free)
             .unwrap();
         tree = tree
-            .insert(RangeInclusive::new(0x350, 0x360).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x350..0x360).unwrap(), NodeState::Free)
             .unwrap();
         tree = tree
-            .insert(RangeInclusive::new(0x340, 0x34F).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x340..0x34F).unwrap(), NodeState::Free)
             .unwrap();
         tree = tree
-            .insert(RangeInclusive::new(0x311, 0x33F).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x311..0x33F).unwrap(), NodeState::Free)
             .unwrap();
         tree = tree.delete_root().unwrap();
         assert!(is_balanced(Some(tree)));
         tree = Box::new(InnerNode::new(
-            RangeInclusive::new(0x300, 0x310).unwrap(),
+            Space::try_from(0x300..0x310).unwrap(),
             NodeState::Allocated,
         ));
         tree = tree
-            .insert(RangeInclusive::new(0x100, 0x110).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x100..0x110).unwrap(), NodeState::Free)
             .unwrap();
         tree = tree
-            .insert(RangeInclusive::new(0x90, 0x9F).unwrap(), NodeState::Free)
-            .unwrap();
-        assert!(is_balanced(Some(tree.clone())));
-        tree = tree
-            .insert(RangeInclusive::new(0x311, 0x313).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x90..0x9F).unwrap(), NodeState::Free)
             .unwrap();
         assert!(is_balanced(Some(tree.clone())));
         tree = tree
-            .insert(RangeInclusive::new(0x314, 0x316).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x311..0x313).unwrap(), NodeState::Free)
             .unwrap();
         assert!(is_balanced(Some(tree.clone())));
         tree = tree
-            .insert(RangeInclusive::new(0x317, 0x319).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x314..0x316).unwrap(), NodeState::Free)
             .unwrap();
         assert!(is_balanced(Some(tree.clone())));
         tree = tree
-            .insert(RangeInclusive::new(0x321, 0x323).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x317..0x319).unwrap(), NodeState::Free)
+            .unwrap();
+        assert!(is_balanced(Some(tree.clone())));
+        tree = tree
+            .insert(Space::try_from(0x321..0x323).unwrap(), NodeState::Free)
             .unwrap();
         assert!(is_balanced(Some(tree.clone())));
 
         tree = tree
-            .delete(&RangeInclusive::new(0x321, 0x323).unwrap())
+            .delete(&Space::try_from(0x321..0x323).unwrap())
             .unwrap();
         tree = tree
-            .delete(&RangeInclusive::new(0x314, 0x316).unwrap())
+            .delete(&Space::try_from(0x314..0x316).unwrap())
             .unwrap();
         tree = tree
-            .delete(&RangeInclusive::new(0x317, 0x319).unwrap())
+            .delete(&Space::try_from(0x317..0x319).unwrap())
             .unwrap();
         assert!(is_balanced(Some(tree.clone())));
         tree = tree
-            .insert(RangeInclusive::new(0x80, 0x8F).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x80..0x8F).unwrap(), NodeState::Free)
             .unwrap();
         tree = tree
-            .insert(RangeInclusive::new(0x70, 0x7F).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x70..0x7F).unwrap(), NodeState::Free)
             .unwrap();
         let _ = tree
-            .insert(RangeInclusive::new(0x60, 0x6F).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x60..0x6F).unwrap(), NodeState::Free)
             .unwrap();
     }
 
     #[test]
     fn test_tree_insert_intersect_negative() {
         let mut tree = Box::new(InnerNode::new(
-            RangeInclusive::new(0x100, 0x200).unwrap(),
+            Space::try_from(0x100..0x200).unwrap(),
             NodeState::Allocated,
         ));
         tree = tree
-            .insert(RangeInclusive::new(0x201, 0x2FF).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x201..0x2FF).unwrap(), NodeState::Free)
             .unwrap();
         assert!(is_balanced(Some(tree.clone())));
         let res = tree
             .clone()
-            .insert(RangeInclusive::new(0x201, 0x2FE).unwrap(), NodeState::Free);
+            .insert(Space::try_from(0x201..0x2FE).unwrap(), NodeState::Free);
         assert_eq!(
             res.unwrap_err(),
             Error::Overlap(
-                RangeInclusive::new(0x201, 0x2FE).unwrap(),
-                RangeInclusive::new(0x201, 0x2FF).unwrap()
+                Space::try_from(0x201..0x2FE).unwrap(),
+                Space::try_from(0x201..0x2FF).unwrap()
             )
         );
         tree = tree
-            .insert(RangeInclusive::new(0x90, 0x9F).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x90..0x9F).unwrap(), NodeState::Free)
             .unwrap();
         assert!(is_balanced(Some(tree.clone())));
-        let res = tree.insert(RangeInclusive::new(0x90, 0x9E).unwrap(), NodeState::Free);
+        let res = tree.insert(Space::try_from(0x90..0x9E).unwrap(), NodeState::Free);
         assert_eq!(
             res.unwrap_err(),
             Error::Overlap(
-                RangeInclusive::new(0x90, 0x9E).unwrap(),
-                RangeInclusive::new(0x90, 0x9F).unwrap()
+                Space::try_from(0x90..0x9E).unwrap(),
+                Space::try_from(0x90..0x9F).unwrap()
             )
         );
     }
 
     #[test]
     fn test_tree_insert_duplicate_negative() {
-        let range = RangeInclusive::new(0x100, 0x200).unwrap();
+        let range = Space::try_from(0x100..0x200).unwrap();
         let tree = Box::new(InnerNode::new(range, NodeState::Allocated));
         let res = tree.insert(range, NodeState::Free);
         assert_eq!(res.unwrap_err(), Error::Overlap(range, range));
@@ -889,19 +873,17 @@ mod tests {
 
     #[test]
     fn test_tree_stack_overflow_negative() {
-        let mut inner_node = InnerNode::new(
-            RangeInclusive::new(0x100, 0x200).unwrap(),
-            NodeState::Allocated,
-        );
+        let mut inner_node =
+            InnerNode::new(Space::try_from(0x100..0x200).unwrap(), NodeState::Allocated);
         inner_node.height = 50;
         let tree = Box::new(inner_node);
-        let res = tree.insert(RangeInclusive::new(0x100, 0x200).unwrap(), NodeState::Free);
+        let res = tree.insert(Space::try_from(0x100..0x200).unwrap(), NodeState::Free);
         assert_eq!(res.unwrap_err(), Error::Overflow);
     }
 
     #[test]
     fn test_tree_mark_as_allocated_invalid_transition() {
-        let range = RangeInclusive::new(0x100, 0x110).unwrap();
+        let range = Space::try_from(0x100..0x110).unwrap();
         let mut tree = Box::new(InnerNode::new(range, NodeState::Allocated));
         assert_eq!(
             tree.mark_as_allocated(&range).unwrap_err(),
@@ -911,15 +893,15 @@ mod tests {
 
     #[test]
     fn test_tree_mark_as_allocated_resource_not_available() {
-        let range = RangeInclusive::new(0x100, 0x110).unwrap();
+        let range = Space::try_from(0x100..0x110).unwrap();
         let mut tree = Box::new(InnerNode::new(range, NodeState::Allocated));
         assert_eq!(
-            tree.mark_as_allocated(&RangeInclusive::new(0x111, 0x112).unwrap())
+            tree.mark_as_allocated(&Space::try_from(0x111..0x112).unwrap())
                 .unwrap_err(),
             Error::ResourceNotAvailable
         );
         assert_eq!(
-            tree.mark_as_allocated(&RangeInclusive::new(0x90, 0x92).unwrap())
+            tree.mark_as_allocated(&Space::try_from(0x90..0x92).unwrap())
                 .unwrap_err(),
             Error::ResourceNotAvailable
         );
@@ -927,8 +909,8 @@ mod tests {
 
     #[test]
     fn test_tree_mark_as_allocated() {
-        let range = RangeInclusive::new(0x100, 0x110).unwrap();
-        let range2 = RangeInclusive::new(0x200, 0x2FF).unwrap();
+        let range = Space::try_from(0x100..0x110).unwrap();
+        let range2 = Space::try_from(0x200..0x2FF).unwrap();
         let mut tree = Box::new(InnerNode::new(range, NodeState::Allocated));
         tree = tree.insert(range2, NodeState::Free).unwrap();
         assert!(tree.mark_as_allocated(&range2).is_ok());
@@ -940,45 +922,43 @@ mod tests {
 
     #[test]
     fn test_tree_delete() {
-        let left_child =
-            InnerNode::new(RangeInclusive::new(0x100, 0x110).unwrap(), NodeState::Free);
-        let right_child =
-            InnerNode::new(RangeInclusive::new(0x300, 0x3FF).unwrap(), NodeState::Free);
+        let left_child = InnerNode::new(Space::try_from(0x100..0x110).unwrap(), NodeState::Free);
+        let right_child = InnerNode::new(Space::try_from(0x300..0x3FF).unwrap(), NodeState::Free);
         let mut tree = Box::new(InnerNode::new(
-            RangeInclusive::new(0x200, 0x290).unwrap(),
+            Space::try_from(0x200..0x290).unwrap(),
             NodeState::Free,
         ));
         tree = tree
             .insert(right_child.key, right_child.node_state)
             .unwrap();
         tree = tree
-            .delete(&RangeInclusive::new(0x200, 0x290).unwrap())
+            .delete(&Space::try_from(0x200..0x290).unwrap())
             .unwrap();
         assert!(is_balanced(Some(tree.clone())));
         tree = tree
-            .insert(RangeInclusive::new(0x200, 0x290).unwrap(), NodeState::Free)
+            .insert(Space::try_from(0x200..0x290).unwrap(), NodeState::Free)
             .unwrap();
         tree = tree.insert(left_child.key, left_child.node_state).unwrap();
         assert!(is_balanced(Some(tree.clone())));
 
         assert_eq!(
             *tree
-                .search(&RangeInclusive::new(0x100, 0x110).unwrap())
+                .search(&Space::try_from(0x100..0x110).unwrap())
                 .unwrap(),
             left_child
         );
         assert_eq!(*tree.search(&right_child.key).unwrap(), right_child);
 
         tree = tree
-            .delete(&RangeInclusive::new(0x200, 0x290).unwrap())
+            .delete(&Space::try_from(0x200..0x290).unwrap())
             .unwrap();
         tree = tree
-            .delete(&RangeInclusive::new(0x300, 0x3FF).unwrap())
+            .delete(&Space::try_from(0x300..0x3FF).unwrap())
             .unwrap();
         assert!(is_balanced(Some(tree.clone())));
         assert_eq!(
             *tree
-                .search(&RangeInclusive::new(0x100, 0x110).unwrap())
+                .search(&Space::try_from(0x100..0x110).unwrap())
                 .unwrap(),
             left_child
         );
@@ -986,7 +966,7 @@ mod tests {
 
     #[test]
     fn test_integer_wrapping() {
-        let mut tree = IntervalTree::new(RangeInclusive::new(0x1, 0xFFFFFFFFFFFFFFFF).unwrap());
+        let mut tree = IntervalTree::new(Space::try_from(0x1..0xFFFFFFFFFFFFFFFF).unwrap());
 
         // We have to create a valid constraint (that has an alignment that is a power of 2).
         // In case the size + the start address would overflow, we want to make sure the appropriate error is returned.
